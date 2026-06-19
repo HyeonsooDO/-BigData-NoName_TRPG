@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 import queue
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
 from tkinter import font as tkfont
+
+from generate_image import IllustrationGenerator
 
 from story_logic import (
     DEFAULT_HOST,
@@ -15,6 +20,102 @@ from story_logic import (
     StoryEngine,
     ThreadedServer,
 )
+
+
+class ImageRequestHandler(BaseHTTPRequestHandler):
+    generator: IllustrationGenerator
+    secret_token: str
+    log: callable
+
+    def do_POST(self):
+        if self.path != "/generate-image":
+            self.send_error(404)
+            return
+
+        auth = self.headers.get("Authorization", "")
+        token = self.headers.get("X-Secret-Token", "")
+        if self.secret_token and auth != f"Bearer {self.secret_token}" and token != self.secret_token:
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length <= 0 or content_length > 1024 * 1024:
+                raise ValueError("요청 본문 크기가 올바르지 않습니다.")
+
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            prompt = str(payload.get("prompt", "")).strip()
+            if not prompt:
+                raise ValueError("prompt가 필요합니다.")
+
+            image_bytes = self.generator.generate(
+                prompt=prompt,
+                negative_prompt=str(payload.get("negative_prompt", "")) or None,
+                width=int(payload.get("width", 768)),
+                height=int(payload.get("height", 768)),
+                steps=int(payload.get("steps", 25)),
+                guidance_scale=float(payload.get("guidance_scale", 7.0)),
+                seed=payload.get("seed"),
+                remove_bg=bool(payload.get("remove_background", True)),
+            )
+
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(image_bytes)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(image_bytes)
+            self.log(f"[image] generated: {len(image_bytes)} bytes")
+        except Exception as exc:
+            self.log(f"[image] error: {exc}")
+            self._send_json(500, {"ok": False, "error": str(exc)})
+
+    def _send_json(self, status: int, payload: dict):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        return
+
+
+class ImageAPIServer:
+    def __init__(self, generator: IllustrationGenerator, log):
+        self.generator = generator
+        self.log = log
+        self.httpd: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+
+    def start(self, host: str, port: int, secret_token: str):
+        if self.httpd is not None:
+            return
+
+        handler = type(
+            "ConfiguredImageRequestHandler",
+            (ImageRequestHandler,),
+            {
+                "generator": self.generator,
+                "secret_token": secret_token,
+                "log": staticmethod(self.log),
+            },
+        )
+
+        self.httpd = ThreadingHTTPServer((host, port), handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.log(f"[image] server started: http://{host}:{port}/generate-image")
+
+    def stop(self):
+        if self.httpd is None:
+            return
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = None
+        self.thread = None
+        self.log("[image] server stopped")
 
 
 def get_preferred_korean_font(size=10):
@@ -47,9 +148,12 @@ class ServerGUI:
         self.queue: queue.Queue = queue.Queue()
         self.engine = StoryEngine(log=self._enqueue_log)
         self.server = ThreadedServer(self.engine, log=self._enqueue_log)
+        self.image_generator = IllustrationGenerator()
+        self.image_server = ImageAPIServer(self.image_generator, self._enqueue_log)
 
         self.host_var = tk.StringVar(value=DEFAULT_HOST)
         self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
+        self.image_port_var = tk.StringVar(value=str(DEFAULT_PORT + 1))
         self.token_var = tk.StringVar(value=DEFAULT_SECRET_TOKEN)
         self.ollama_var = tk.StringVar(value=DEFAULT_OLLAMA_URL)
         self.model_var = tk.StringVar(value=DEFAULT_MODEL_NAME)
@@ -73,17 +177,18 @@ class ServerGUI:
 
         top = ttk.LabelFrame(self.root, text="서버 설정", padding=10)
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-        for i in range(5):
+        for i in range(6):
             top.columnconfigure(i, weight=1)
 
         self._entry(top, "호스트", self.host_var, 0, 0)
         self._entry(top, "포트", self.port_var, 0, 1)
-        self._entry(top, "토큰", self.token_var, 0, 2, show="*")
-        self._entry(top, "Ollama URL", self.ollama_var, 0, 3)
-        self._entry(top, "모델명", self.model_var, 0, 4)
+        self._entry(top, "이미지 포트", self.image_port_var, 0, 2)
+        self._entry(top, "토큰", self.token_var, 0, 3, show="*")
+        self._entry(top, "Ollama URL", self.ollama_var, 0, 4)
+        self._entry(top, "모델명", self.model_var, 0, 5)
 
         actions = ttk.Frame(top)
-        actions.grid(row=2, column=0, columnspan=5, sticky="e", pady=(8, 0))
+        actions.grid(row=2, column=0, columnspan=6, sticky="e", pady=(8, 0))
         self.start_btn = ttk.Button(actions, text="서버 시작", command=self.start_server)
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(actions, text="서버 중지", command=self.stop_server, state="disabled")
@@ -151,6 +256,7 @@ class ServerGUI:
         try:
             host = self.host_var.get().strip() or DEFAULT_HOST
             port = int(self.port_var.get().strip())
+            image_port = int(self.image_port_var.get().strip())
         except ValueError:
             messagebox.showwarning("입력 오류", "포트는 숫자여야 합니다.")
             return
@@ -160,18 +266,21 @@ class ServerGUI:
             model_name=self.model_var.get().strip() or DEFAULT_MODEL_NAME,
         )
         try:
-            self.server.start(host, port, self.token_var.get().strip() or DEFAULT_SECRET_TOKEN)
+            token = self.token_var.get().strip() or DEFAULT_SECRET_TOKEN
+            self.server.start(host, port, token)
+            self.image_server.start(host, image_port, token)
         except Exception as exc:
             messagebox.showerror("시작 실패", str(exc))
             return
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_var.set(f"실행 중 - {host}:{port}")
+        self.status_var.set(f"실행 중 - 스토리 {host}:{port} / 이미지 {host}:{image_port}")
         self.refresh_sessions()
 
     def stop_server(self):
         self.server.stop()
+        self.image_server.stop()
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("중지됨")
@@ -212,8 +321,7 @@ class ServerGUI:
         if not sel:
             return
         session_id = self.session_list.get(sel[0])
-        with self.engine.sessions_lock:
-            self.engine.sessions.pop(session_id, None)
+        self.engine.delete_session(session_id)
         self.refresh_sessions()
         self._set_preview("")
         self._append_log(f"[session] deleted: {session_id}")
@@ -233,6 +341,7 @@ class ServerGUI:
     def on_close(self):
         try:
             self.server.stop()
+            self.image_server.stop()
         except Exception:
             pass
         self.root.destroy()
